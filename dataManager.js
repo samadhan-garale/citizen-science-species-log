@@ -19,6 +19,7 @@ const DM = {
 
   // The key used to store sightings in localStorage
   storageKey: 'citizenScienceSightings',
+  storageKey: 'sightings',
 
   // Separate cache for internet species thumbnails.
   imageCacheKey: 'citizenScienceSpeciesImageCache',
