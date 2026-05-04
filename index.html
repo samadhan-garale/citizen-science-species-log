@@ -13,6 +13,74 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <div id="authGate" class="auth-gate">
+    <form id="authForm" class="auth-card" novalidate autocomplete="off">
+
+      <!-- Brand Header -->
+      <div class="auth-brand-block">
+        <div class="auth-sdg-pill-inline">🌿 SDG 15</div>
+        <h1 class="auth-title-main">BioDiversity Log</h1>
+        <p class="auth-subtitle-main">Secure citizen science intelligence platform</p>
+      </div>
+
+      <!-- Tab switcher -->
+      <div class="auth-tabs" role="tablist">
+        <button type="button" id="authLoginTab" class="active" role="tab" aria-selected="true">🔐 Login</button>
+        <button type="button" id="authRegisterTab" role="tab" aria-selected="false">📝 Register</button>
+      </div>
+
+      <!-- Full Name — register only -->
+      <div class="auth-field" id="authFullNameField" style="display:none">
+        <label for="authFullName">Full Name</label>
+        <input id="authFullName" type="text" placeholder="Your full name" autocomplete="name" />
+      </div>
+
+      <!-- Username -->
+      <div class="auth-field">
+        <label for="authUsername">Username</label>
+        <input id="authUsername" type="text" placeholder="Enter username" autocomplete="username" required />
+      </div>
+
+      <!-- Password -->
+      <div class="auth-field">
+        <label for="authPassword">Password</label>
+        <input id="authPassword" type="password" placeholder="Enter password" autocomplete="current-password" required />
+      </div>
+
+      <!-- Confirm Password — register only -->
+      <div class="auth-field" id="authConfirmField" style="display:none">
+        <label for="authConfirmPassword">Confirm Password</label>
+        <input id="authConfirmPassword" type="password" placeholder="Re-enter password" autocomplete="new-password" />
+      </div>
+
+      <!-- Remember Me — login only -->
+      <div class="auth-remember" id="authRememberRow">
+        <label class="auth-check-label">
+          <input type="checkbox" id="authRememberMe" />
+          <span>Remember me</span>
+        </label>
+      </div>
+
+      <!-- Error message -->
+      <p id="authError" class="auth-error" role="alert"></p>
+
+      <!-- Submit -->
+      <button id="authSubmit" class="auth-primary" type="submit">🔐 Login</button>
+
+      <!-- Footer hint -->
+      <p class="auth-hint" id="authHint">
+        New here? <button type="button" class="auth-link" id="authSwitchToRegister">Create account</button>
+      </p>
+    </form>
+  </div>
+
+  <div id="authSessionBar" class="auth-session-bar">
+    <strong id="authSessionName"></strong>
+    <span id="authUserCount" hidden></span>
+    <select id="adminUserFilter" hidden></select>
+    <button id="logoutBtn" type="button">Logout</button>
+  </div>
+
   <nav class="topbar" id="mainNav" aria-label="Main navigation">
     <a class="brand" href="#dashboard">
       <span class="brand-mark" aria-hidden="true">15</span>
@@ -28,6 +96,7 @@
       <a href="#map" class="nav-tab" data-nav-target="map">Map</a>
       <a href="#analytics" class="nav-tab" data-nav-target="analytics">Analytics</a>
       <a href="#speciesGallery" class="nav-tab" data-nav-target="speciesGallery">Species Gallery</a>
+      <a href="#adminPanel" class="nav-tab" data-nav-target="adminPanel" id="adminNavTab" style="display:none">👑 Admin</a>
     </div>
 
     <div class="topbar-actions">
@@ -307,6 +376,11 @@
     <span>SDG 15 Life on Land Biodiversity Intelligence Platform</span>
   </footer>
 
+  <!-- ADMIN PANEL SECTION (hidden unless admin is logged in) -->
+  <section class="admin-panel-section" id="adminPanel" style="display:none" aria-label="Admin control panel">
+    <div id="adminPanelContent" class="admin-panel-content"><!-- rendered by Auth.renderAdminPanel() --></div>
+  </section>
+
   <div id="rarityModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="rarityModalTitle">
     <div class="modal-content">
       <div class="modal-header">
@@ -400,6 +474,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="dataManager.js"></script>
+  <script src="authManager.js"></script>
   <script src="script.js" defer></script>
 </body>
 </html>
