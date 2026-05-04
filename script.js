@@ -3,7 +3,7 @@
 // persistence, rendering, filtering, charts, map, and modal behavior.
 
 const datasetUrl = 'species_baseline.json';
-const storageKey = 'citizenScienceSightings';
+const storageKey = 'citizenScienceSightings'; // primary localStorage key for sightings
 const themeKey = 'citizenScienceTheme';
 
 const $ = (id) => document.getElementById(id);
@@ -180,7 +180,11 @@ function normalizeSighting(raw) {
     rarityIndex: Number(raw.rarityIndex) || 0,
     rarityLabel: raw.rarityLabel || 'Insufficient Data',
     createdAt: raw.createdAt || new Date().toISOString(),
-    updatedAt: raw.updatedAt || raw.createdAt || new Date().toISOString()
+    updatedAt: raw.updatedAt || raw.createdAt || new Date().toISOString(),
+    // ── Ownership fields ─ MUST be preserved for role-based filtering ──
+    userId: raw.userId || '',
+    username: raw.username || '',
+    roleAtCreation: raw.roleAtCreation || raw.role || ''
   };
 }
 
@@ -604,6 +608,11 @@ function updateCharts() {
 
 function initializeRealMap() {
   if (!window.L || realMap) return;
+  if (!window.L) return;
+  if (realMap) {
+    realMap.invalidateSize();
+    return;
+  }
   realMap = L.map('realMap').setView([19.0760, 72.8777], 7);
   const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors',
@@ -620,9 +629,22 @@ function initializeRealMap() {
   L.control.scale().addTo(realMap);
 }
 
+/* ── Auth helper — resolves a userId to its role string ─────────── */
+function getAuthUserRole(userId) {
+  if (!userId) return 'user';
+  if (userId === 'samadhan-root') return 'super_admin';
+  try {
+    const users = JSON.parse(localStorage.getItem('biodiversity_users') || '[]');
+    const found = users.find((u) => u.userId === userId || u.id === userId);
+    return found ? found.role : 'user';
+  } catch { return 'user'; }
+}
+
 function markerPopup(sighting) {
   const rarity = getRarityInfo(sighting.species);
   const score = Math.max(5, Math.min(100, Math.round((1 / Math.max(sighting.rarityIndex || 1, 0.1)) * 14)));
+  const uRole = getAuthUserRole(sighting.userId);
+  const roleBadge = (uRole === 'admin' || uRole === 'super_admin') ? `<span class="badge badge-normal" style="margin-left:5px">Admin</span>` : '';
   return `
     <div class="popup-card" id="popup-${escapeHTML(sighting.id)}">
       <img src="${escapeHTML(imageForSighting(sighting))}" alt="${escapeHTML(sighting.species)}" class="popup-image" data-species-image="true" data-sighting-id="${escapeHTML(sighting.id)}" data-species="${escapeHTML(sighting.species)}" data-category="${escapeHTML(sighting.category)}">
@@ -640,6 +662,7 @@ function markerPopup(sighting) {
       <p class="popup-notes">${escapeHTML(sighting.notes || 'No notes available')}</p>
       <div class="popup-footer">
         <span>${sighting.favorite ? 'Favorite record' : 'Field record'}</span>
+        <span>Logged by: ${escapeHTML(sighting.username || 'Unknown')} ${roleBadge}</span>
         <span>Biodiversity score ${score}</span>
       </div>
     </div>
@@ -889,6 +912,24 @@ function debounce(fn, delay) {
   };
 }
 
+/* ── Species dataset loader ─────────────────────────────────────── */
+async function loadSpeciesDataset() {
+  try {
+    const res = await fetch(datasetUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = await res.json();
+    const arr = Array.isArray(raw) ? raw : (Array.isArray(raw.data) ? raw.data : []);
+    speciesData = arr.map(normalizeSpeciesEntry);
+    speciesMap = new Map(speciesData.map((s) => [s.name, s]));
+  } catch (err) {
+    console.warn('[loadSpeciesDataset] Species baseline failed:', err);
+    // Continue even if species file is missing
+  }
+  initializeFormOptions();
+  loadStoredSightings(); // migrate + apply visibility
+}
+
+
 async function searchLocations(query) {
   if (!query || query.length < 2) {
     els.locationSuggestions.classList.remove('show');
@@ -1115,8 +1156,604 @@ function bindEvents() {
   });
 }
 
+// ===== Additive Auth + Role-Based Visibility Layer =====
+// Storage keys — must stay in sync with authManager.js
+const AUTH_ALL_SIGHTINGS_KEY = 'biodiversity_all_sightings';
+const AUTH_USERS_KEY = 'biodiversity_users';
+const AUTH_SESSION_KEY = 'biodiversity_current_user';
+
+// Super-admin credentials: samadhan / samadhan
+const AUTH_ADMIN = {
+  userId: 'samadhan-root',
+  username: 'samadhan',
+  role: 'super_admin'
+};
+// Legacy owner for sightings created before auth was added
+const AUTH_LEGACY_OWNER = {
+  userId: 'samadhan-root',
+  username: 'samadhan'
+};
+
+let authMode = 'login';
+let currentAuthUser = null;
+
+async function authHashPassword(password) {
+  const bytes = new TextEncoder().encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function authReadJSON(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback));
+  } catch {
+    return fallback;
+  }
+}
+
+function authWriteJSON(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function authGetUsers() {
+  return authReadJSON(AUTH_USERS_KEY, []);
+}
+
+function authSetUsers(users) {
+  authWriteJSON(AUTH_USERS_KEY, users);
+}
+
+function authGetAllSightings() {
+  return authReadJSON(AUTH_ALL_SIGHTINGS_KEY, []);
+}
+
+function authSetAllSightings(records) {
+  authWriteJSON(AUTH_ALL_SIGHTINGS_KEY, records);
+}
+
+// ── MASTER ROLE CHECK ── super_admin and admin both have elevated access
+function authIsAdmin() {
+  return Boolean(
+    currentAuthUser &&
+    (currentAuthUser.role === 'admin' || currentAuthUser.role === 'super_admin')
+  );
+}
+
+// Kept here as single authoritative definition (also defined near markerPopup for map use)
+function getAuthUserRole(userId) {
+  if (!userId) return 'user';
+  if (userId === AUTH_ADMIN.userId) return 'super_admin';
+  try {
+    const users = authGetUsers();
+    const found = users.find((u) => u.userId === userId);
+    return found ? found.role : 'user';
+  } catch { return 'user'; }
+}
+
+function authAttachOwner(record) {
+  if (record.userId && record.username) return record;
+  return {
+    ...record,
+    userId: AUTH_LEGACY_OWNER.userId,
+    username: AUTH_LEGACY_OWNER.username
+  };
+}
+
+function authVisibleRecords(records) {
+  const owned = records.map(authAttachOwner);
+  if (authIsAdmin()) return owned;
+  return owned.filter((item) => item.userId === currentAuthUser.userId);
+}
+
+/*
+ * ── MASTER DATABASE ARCHITECTURE ──────────────────────────────────────────
+ * masterSightings  =  ALL sightings from ALL users  (single source of truth)
+ * getVisibleSightings() = role-filtered VIEW of the master DB
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+/** Public API: returns sightings the current user is allowed to see */
+function getVisibleSightings() {
+  if (!currentAuthUser) return [];
+  const master = authGetAllSightings();
+  if (authIsAdmin()) return master;
+  return master.filter((s) => s.userId === currentAuthUser.userId);
+}
+
+const AUTH_MIGRATED_KEY = 'biodiversity_sightings_migrated_v2';
+
+function authMigrateExistingSightingsOnce() {
+  // Guard: only run once per device so old global data doesn't keep leaking in
+  if (localStorage.getItem(AUTH_MIGRATED_KEY) === 'done') return;
+
+  const existingAll = authGetAllSightings();
+  // Read old shared storage (citizenScienceSightings)
+  let legacyLoaded = [];
+  try {
+    const legacyRaw = window.DM && DM.load ? DM.load() : authReadJSON(storageKey, []);
+    legacyLoaded = Array.isArray(legacyRaw) ? legacyRaw : [];
+  } catch { legacyLoaded = []; }
+
+  const mergedById = new Map();
+
+  // Existing auth-aware sightings take priority
+  existingAll.forEach((item) => {
+    const patched = authAttachOwner(item);
+    if (patched.id) mergedById.set(patched.id, patched);
+  });
+
+  // Legacy sightings: assign to samadhan-root (admin) if no owner
+  legacyLoaded.forEach((item) => {
+    const patched = authAttachOwner(item);
+    if (patched.id && !mergedById.has(patched.id)) mergedById.set(patched.id, patched);
+  });
+
+  authSetAllSightings(Array.from(mergedById.values()));
+  localStorage.setItem(AUTH_MIGRATED_KEY, 'done');
+}
+
+function authRefreshAdminTools() {
+  const bar = document.getElementById('authSessionBar');
+  const name = document.getElementById('authSessionName');
+  const count = document.getElementById('authUserCount');
+  const filter = document.getElementById('adminUserFilter');
+  const adminNavTab = document.getElementById('adminNavTab');
+  const adminPanel = document.getElementById('adminPanel');
+
+  if (!bar || !name || !count || !filter || !currentAuthUser) return;
+
+  bar.style.display = 'flex';
+  name.textContent = authIsAdmin()
+    ? `${currentAuthUser.role === 'super_admin' ? '👑 Super Admin' : '🛡️ Admin'}: ${currentAuthUser.username}`
+    : `👤 ${currentAuthUser.username}`;
+
+  const users = authGetUsers();
+  count.hidden = !authIsAdmin();
+  count.textContent = `Users: ${users.length}`;
+
+  filter.hidden = !authIsAdmin();
+  if (authIsAdmin()) {
+    const previous = filter.value;
+    const allRecords = authGetAllSightings();
+    const userOptions = Array.from(new Map(
+      allRecords.map((r) => [r.userId || AUTH_LEGACY_OWNER.userId, r.username || AUTH_LEGACY_OWNER.username])
+    ).entries());
+
+    filter.innerHTML = '<option value="">All Users</option>' + userOptions
+      .map(([userId, username]) => `<option value="${escapeHTML(userId)}">${escapeHTML(username)}</option>`)
+      .join('');
+
+    filter.value = previous;
+  }
+
+  if (adminNavTab) adminNavTab.style.display = authIsAdmin() ? '' : 'none';
+  // Render admin panel if it's currently visible
+  if (adminPanel && adminPanel.style.display !== 'none' && authIsAdmin()) {
+    if (window.Auth && Auth.renderAdminPanel) Auth.renderAdminPanel();
+  }
+}
+
+/* Simple dedup that preserves ownership — does NOT call normalizeSighting */
+function authSafeDedup(arr) {
+  const seen = new Set();
+  return arr.filter((item) => {
+    if (!item || !item.id || seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
+function authApplyVisibility() {
+  const allRecords = authGetAllSightings();
+  let visible = authVisibleRecords(allRecords);
+
+  const adminFilter = document.getElementById('adminUserFilter');
+  if (authIsAdmin() && adminFilter && adminFilter.value) {
+    visible = visible.filter((item) => item.userId === adminFilter.value);
+  }
+
+  // Use authSafeDedup — NOT dedupeSightings — to avoid stripping ownership
+  sightings = authSafeDedup(visible);
+  updateAllRarityProperties();
+  authRefreshAdminTools();
+  refreshAll();
+}
+
+function authShowGate(show) {
+  const gate = document.getElementById('authGate');
+  const bar = document.getElementById('authSessionBar');
+  const appNodes = [
+    document.getElementById('mainNav'),
+    document.querySelector('.hero-section'),
+    document.getElementById('appSection'),
+    document.querySelector('.page-footer')
+  ];
+
+  if (gate) gate.style.display = show ? 'grid' : 'none';
+  appNodes.forEach((node) => {
+    if (node) node.style.display = show ? 'none' : '';
+  });
+  if (bar) bar.style.display = show ? 'none' : 'flex';
+
+  if (!show && realMap) {
+    setTimeout(() => realMap.invalidateSize(), 300);
+  }
+}
+
+function authSetMode(mode) {
+  authMode = mode;
+  const loginTab = document.getElementById('authLoginTab');
+  const registerTab = document.getElementById('authRegisterTab');
+  const submit = document.getElementById('authSubmit');
+  const hint = document.getElementById('authHint');
+  const switchBtn = document.getElementById('authSwitchToRegister');
+  const fullNameField = document.getElementById('authFullNameField');
+  const confirmField = document.getElementById('authConfirmField');
+  const rememberRow = document.getElementById('authRememberRow');
+
+  if (loginTab) { loginTab.classList.toggle('active', mode === 'login'); loginTab.setAttribute('aria-selected', mode === 'login'); }
+  if (registerTab) { registerTab.classList.toggle('active', mode === 'register'); registerTab.setAttribute('aria-selected', mode === 'register'); }
+
+  if (submit) submit.textContent = mode === 'login' ? '🔐 Login' : '📝 Create Account';
+  if (fullNameField) fullNameField.style.display = mode === 'register' ? 'grid' : 'none';
+  if (confirmField) confirmField.style.display = mode === 'register' ? 'grid' : 'none';
+  if (rememberRow) rememberRow.style.display = mode === 'login' ? 'flex' : 'none';
+
+  if (hint && switchBtn) {
+    if (mode === 'login') {
+      hint.innerHTML = 'New here? <button type="button" class="auth-link" id="authSwitchToRegister">Create account</button>';
+    } else {
+      hint.innerHTML = 'Already have one? <button type="button" class="auth-link" id="authSwitchToRegister">Login</button>';
+    }
+    document.getElementById('authSwitchToRegister')?.addEventListener('click', () => authSetMode(mode === 'login' ? 'register' : 'login'));
+  }
+
+  const error = document.getElementById('authError');
+  if (error) error.textContent = '';
+}
+
+async function authRegister(username, password) {
+  const cleanUsername = username.trim();
+  const fullName = document.getElementById('authFullName')?.value.trim() || cleanUsername;
+  const confirmPass = document.getElementById('authConfirmPassword')?.value || '';
+
+  if (!cleanUsername || !password) throw new Error('Username and password are required.');
+  if (cleanUsername.length < 3) throw new Error('Username must be at least 3 characters.');
+  if (password.length < 4) throw new Error('Password must be at least 4 characters.');
+  if (confirmPass && confirmPass !== password) throw new Error('Passwords do not match.');
+  if (cleanUsername.toLowerCase() === 'samadhan') throw new Error('This username is reserved.');
+
+  const users = authGetUsers();
+  if (users.some((user) => user.username.toLowerCase() === cleanUsername.toLowerCase())) {
+    throw new Error('Username already taken. Choose another.');
+  }
+
+  const user = {
+    userId: `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    fullName,
+    username: cleanUsername,
+    passwordHash: await authHashPassword(password),
+    role: 'user',
+    createdAt: new Date().toISOString(),
+    lastLogin: new Date().toISOString(),
+    isActive: true
+  };
+
+  users.push(user);
+  authSetUsers(users);
+
+  currentAuthUser = { userId: user.userId, username: user.username, fullName: user.fullName, role: user.role };
+  authWriteJSON(AUTH_SESSION_KEY, currentAuthUser);
+}
+
+async function authLogin(username, password) {
+  const cleanUsername = username.trim();
+  if (!cleanUsername || !password) throw new Error('Username and password are required.');
+
+  // Hard-coded super-admin bypass — samadhan / samadhan
+  if (cleanUsername.toLowerCase() === 'samadhan' &&
+      (password === 'samadhan' || password === 'Samadhan@123')) {
+    currentAuthUser = { ...AUTH_ADMIN };
+    authWriteJSON(AUTH_SESSION_KEY, currentAuthUser);
+    return;
+  }
+
+  const users = authGetUsers();
+  const user = users.find((item) => item.username.toLowerCase() === cleanUsername.toLowerCase());
+  if (!user) throw new Error('User not found. Please register first.');
+  if (user.isActive === false) throw new Error('Account disabled. Contact admin.');
+
+  const passwordHash = await authHashPassword(password);
+  if (passwordHash !== user.passwordHash) throw new Error('Incorrect password.');
+
+  // Update lastLogin
+  user.lastLogin = new Date().toISOString();
+  authSetUsers(users);
+
+  currentAuthUser = { userId: user.userId, username: user.username, fullName: user.fullName || user.username, role: user.role };
+  authWriteJSON(AUTH_SESSION_KEY, currentAuthUser);
+}
+
+function authLogout() {
+  localStorage.removeItem(AUTH_SESSION_KEY);
+  currentAuthUser = null;
+  sightings = [];
+  authShowGate(true);
+}
+
+// Override normalizeSighting: stamp new/legacy sightings with owner; preserve existing ownership.
+const authOriginalNormalizeSighting = normalizeSighting;
+normalizeSighting = function authNormalizeSighting(raw) {
+  const normalized = authOriginalNormalizeSighting(raw);
+  if (!normalized) return null;
+
+  // If the RAW record already has an owner, preserve it faithfully
+  if (raw.userId) {
+    return {
+      ...normalized,
+      userId: raw.userId,
+      username: raw.username || '',
+      roleAtCreation: raw.roleAtCreation || raw.role || ''
+    };
+  }
+
+  // Brand-new sighting being created — stamp with the current logged-in user
+  if (currentAuthUser) {
+    return {
+      ...normalized,
+      userId: currentAuthUser.userId,
+      username: currentAuthUser.username,
+      roleAtCreation: currentAuthUser.role
+    };
+  }
+
+  // Fallback for legacy/unowned — assign to super-admin
+  return {
+    ...normalized,
+    userId: AUTH_LEGACY_OWNER.userId,
+    username: AUTH_LEGACY_OWNER.username,
+    roleAtCreation: 'super_admin'
+  };
+};
+
+loadStoredSightings = function authLoadStoredSightings() {
+  authMigrateExistingSightingsOnce();
+  authApplyVisibility();
+};
+
+saveSightings = function authSaveSightings() {
+  if (!currentAuthUser) return;
+  const master = authGetAllSightings();
+
+  let nextMaster;
+  if (authIsAdmin()) {
+    // Admin edited/deleted from their view — merge changes back into master
+    const visibleIds = new Set(sightings.map((s) => s.id));
+    const others = master.filter((s) => !visibleIds.has(s.id));
+    nextMaster = [...others, ...sightings.map(authAttachOwner)];
+  } else {
+    // Normal user — replace only their slice of the master DB
+    const others = master.filter((s) => s.userId !== currentAuthUser.userId);
+    const mine = sightings.map((s) => ({
+      ...s,
+      userId: currentAuthUser.userId,
+      username: currentAuthUser.username,
+      roleAtCreation: currentAuthUser.role
+    }));
+    nextMaster = [...others, ...mine];
+  }
+
+  // authSafeDedup: never calls normalizeSighting, never strips ownership
+  authSetAllSightings(authSafeDedup(nextMaster));
+};
+
+exportJSON = function authExportJSON() {
+  if (window.DM) DM.exportJSON(sightings);
+};
+
+exportCSV = function authExportCSV() {
+  if (window.DM) DM.exportCSV(sightings);
+};
+
+exportPrint = function authExportPrint() {
+  if (window.DM) DM.exportPrintReport(sightings);
+};
+
+resetAllData = function authResetAllData() {
+  if (!currentAuthUser) return;
+
+  if (authIsAdmin()) {
+    if (!confirm('Admin: clear ALL sightings from ALL users?')) return;
+    authSetAllSightings([]);
+  } else {
+    if (!confirm('Clear only your sightings?')) return;
+    const remaining = authGetAllSightings().filter((item) => item.userId !== currentAuthUser.userId);
+    authSetAllSightings(remaining);
+  }
+
+  authApplyVisibility();
+  showToast('Sightings cleared.');
+};
+
+window.authPromoteUser = function (userId) {
+  const users = authGetUsers();
+  const user = users.find((u) => u.userId === userId);
+  if (user) {
+    user.role = 'admin';
+    authSetUsers(users);
+    renderAdminDashboard();
+    showToast(`✅ ${user.username} promoted to Admin.`);
+  }
+};
+
+window.authDemoteUser = function (userId) {
+  const users = authGetUsers();
+  const user = users.find((u) => u.userId === userId);
+  if (user && user.role !== 'super_admin') {
+    user.role = 'user';
+    authSetUsers(users);
+    renderAdminDashboard();
+    showToast(`↙️ ${user.username} demoted to User.`);
+  }
+};
+
+window.authToggleDisable = function (userId) {
+  const users = authGetUsers();
+  const user = users.find((u) => u.userId === userId);
+  if (user && user.userId !== AUTH_ADMIN.userId) {
+    user.isActive = user.isActive === false ? true : false;
+    authSetUsers(users);
+    renderAdminDashboard();
+    showToast(user.isActive ? `Account re-enabled.` : `Account disabled.`);
+  }
+};
+
+window.authDeleteUser = function (userId) {
+  if (userId === AUTH_ADMIN.userId) { showToast('Cannot delete super admin.', 'error'); return; }
+  if (!confirm('Delete this user and all their sightings? This cannot be undone.')) return;
+  authSetUsers(authGetUsers().filter((u) => u.userId !== userId));
+  authSetAllSightings(authGetAllSightings().filter((s) => s.userId !== userId));
+  renderAdminDashboard();
+  authApplyVisibility();
+  showToast('User deleted.');
+};
+
+function renderAdminDashboard() {
+  const adminPanel = document.getElementById('adminPanel');
+  if (!adminPanel || !authIsAdmin()) return;
+
+  // Try the richer authManager.js panel first; fall back to inline table
+  if (window.Auth && typeof Auth.renderAdminPanel === 'function') {
+    Auth.renderAdminPanel();
+    return;
+  }
+
+  const tbody = document.getElementById('usersTableBody');
+  if (!tbody) return;
+
+  const users = authGetUsers();
+  const master = authGetAllSightings();
+
+  tbody.innerHTML = users.map((user) => {
+    const isSelf = user.userId === currentAuthUser.userId;
+    const count = master.filter((s) => s.userId === user.userId).length;
+    const roleColor = user.role === 'super_admin' ? '#ef4444' : user.role === 'admin' ? '#f59e0b' : '#3b82f6';
+    const statusBadge = user.isActive === false ? '<span style="color:#f87171;font-size:.75rem"> [disabled]</span>' : '';
+
+    let actions = '';
+    if (!isSelf && currentAuthUser.role === 'super_admin') {
+      if (user.role === 'admin') {
+        actions += `<button class="btn btn-secondary small" onclick="authDemoteUser('${user.userId}')">Demote</button> `;
+      } else if (user.role === 'user') {
+        actions += `<button class="btn btn-secondary small" onclick="authPromoteUser('${user.userId}')">Promote</button> `;
+      }
+      if (user.role !== 'super_admin') {
+        const disabled = user.isActive === false;
+        actions += `<button class="btn btn-secondary small" onclick="authToggleDisable('${user.userId}')">${disabled ? 'Enable' : 'Disable'}</button> `;
+        actions += `<button class="btn btn-danger small" onclick="authDeleteUser('${user.userId}')">Delete</button>`;
+      }
+    } else if (!isSelf && currentAuthUser.role === 'admin' && user.role === 'user') {
+      actions += `<button class="btn btn-danger small" onclick="authDeleteUser('${user.userId}')">Delete</button>`;
+    }
+
+    return `
+      <tr>
+        <td><strong>${escapeHTML(user.username)}</strong>${statusBadge}</td>
+        <td><span class="category-pill" style="--pill-color:${roleColor}">${escapeHTML(user.role)}</span></td>
+        <td>${count}</td>
+        <td>${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}</td>
+        <td class="table-actions">${actions}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function authBindUI() {
+  const form = document.getElementById('authForm');
+  const loginTab = document.getElementById('authLoginTab');
+  const registerTab = document.getElementById('authRegisterTab');
+  const logoutBtn = document.getElementById('logoutBtn');
+  const adminFilter = document.getElementById('adminUserFilter');
+
+  loginTab?.addEventListener('click', () => authSetMode('login'));
+  registerTab?.addEventListener('click', () => authSetMode('register'));
+
+  // Wire the initial switch link
+  document.getElementById('authSwitchToRegister')?.addEventListener('click', () => authSetMode('register'));
+
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const username = document.getElementById('authUsername')?.value || '';
+    const password = document.getElementById('authPassword')?.value || '';
+    const error = document.getElementById('authError');
+    const submitBtn = document.getElementById('authSubmit');
+
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '⏳ Please wait...'; }
+    if (error) error.textContent = '';
+
+    try {
+      if (authMode === 'login') await authLogin(username, password);
+      else await authRegister(username, password);
+
+      authShowGate(false);
+      // Load species dataset first if not already loaded, then apply visibility
+      if (!speciesData.length) {
+        await loadSpeciesDataset();
+      }
+      authApplyVisibility();
+      showToast(`Welcome, ${currentAuthUser.username}! 🌿`);
+    } catch (err) {
+      if (error) error.textContent = err.message;
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = authMode === 'login' ? '🔐 Login' : '📝 Create Account';
+      }
+    }
+  });
+
+  logoutBtn?.addEventListener('click', authLogout);
+  adminFilter?.addEventListener('change', authApplyVisibility);
+}
+
+// Auto-seeds samadhan / samadhan as super_admin on very first load
+async function authInitBootstrap() {
+  const users = authGetUsers();
+  if (!users.some((u) => u.username === 'samadhan')) {
+    const hash = await authHashPassword('samadhan');
+    users.push({
+      userId: AUTH_ADMIN.userId,
+      username: AUTH_ADMIN.username,
+      passwordHash: hash,
+      role: 'super_admin',
+      createdAt: new Date().toISOString()
+    });
+    authSetUsers(users);
+  }
+}
+
+function authInit() {
+  authBindUI();
+  currentAuthUser = authReadJSON(AUTH_SESSION_KEY, null);
+  if (!currentAuthUser) {
+    authShowGate(true);
+    return;
+  }
+  // Valid session found — show the app immediately, data loads in loadSpeciesDataset()
+  authShowGate(false);
+  // Quick render with whatever is already in master DB (before fetch completes)
+  const quick = getVisibleSightings();
+  sightings = authSafeDedup(quick);
+  updateAllRarityProperties();
+  authRefreshAdminTools();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   initTheme();
   bindEvents();
-  loadSpeciesDataset();
+  authInitBootstrap().then(() => {
+    authInit();
+    // Only load species+sightings after session is validated
+    if (!currentAuthUser) return;
+    loadSpeciesDataset(); // fetch species JSON → loadStoredSightings → authApplyVisibility
+  });
 });
